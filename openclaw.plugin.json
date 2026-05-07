@@ -2,7 +2,9 @@
   "id": "openclaw-linear",
   "name": "Linear",
   "description": "Linear project management integration for OpenClaw",
-  "skills": ["./skills"],
+  "skills": [
+    "./skills"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -19,17 +21,23 @@
       },
       "teamIds": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "Linear team keys to listen for (e.g. [\"ENG\", \"OPS\"]). Empty = all teams."
       },
       "eventFilter": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "Event types to handle (e.g. [\"Issue\", \"Comment\"]). Empty = all types."
       },
       "agentMapping": {
         "type": "object",
-        "additionalProperties": { "type": "string" },
+        "additionalProperties": {
+          "type": "string"
+        },
         "description": "Map Linear user IDs to OpenClaw agent IDs for routing (e.g. {\"linear-user-uuid\": \"agent-name\"})"
       },
       "debounceMs": {
@@ -38,10 +46,30 @@
       },
       "stateActions": {
         "type": "object",
-        "additionalProperties": { "type": "string", "enum": ["add", "remove", "ignore"] },
+        "additionalProperties": {
+          "type": "string",
+          "enum": [
+            "add",
+            "remove",
+            "ignore"
+          ]
+        },
         "description": "Map Linear state types or names to queue actions. Keys can be state types (triage, backlog, unstarted, started, completed, canceled) or state names (e.g. \"In Review\", \"Todo\"). Name matches take precedence over type matches (case-insensitive). Actions: add (re-add to queue), remove (remove from queue), ignore (do nothing). Defaults: backlog/unstarted=add, completed/canceled=remove, others=ignore."
       }
     },
-    "required": ["webhookSecret", "apiKey"]
+    "required": [
+      "webhookSecret",
+      "apiKey"
+    ]
+  },
+  "contracts": {
+    "tools": [
+      "linear_queue",
+      "linear_issue",
+      "linear_comment",
+      "linear_team",
+      "linear_project",
+      "linear_relation"
+    ]
   }
 }

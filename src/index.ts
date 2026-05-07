@@ -1,5 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { existsSync, readFileSync } from "node:fs";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createEventRouter, type RouterAction } from "./event-router.js";
 import { InboxQueue, type EnqueueEntry } from "./work-queue.js";
@@ -13,6 +14,7 @@ import { createRelationTool } from "./tools/linear-relation-tool.js";
 
 const CHANNEL_ID = "linear";
 const DEFAULT_DEBOUNCE_MS = 30_000;
+const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 const EVENT_LABELS: Record<string, string> = {
   "issue.assigned": "Assigned",
@@ -97,8 +99,8 @@ async function dispatchConsolidatedActions(
     RawBody: body,
     CommandBody: body,
     From: `${CHANNEL_ID}:${first.linearUserId}`,
-    To: `${CHANNEL_ID}:${route.agentId ?? first.agentId}`,
-    SessionKey: route.sessionKey,
+    To: `${CHANNEL_ID}:${first.agentId}`,
+    SessionKey: `agent:${first.agentId}:main`,
     AccountId: route.accountId ?? "default",
     ChatType: "direct",
     ConversationLabel: `Linear: batch (${actions.length} events)`,
@@ -125,6 +127,59 @@ async function dispatchConsolidatedActions(
   });
 }
 
+function readJojoAgentAccessToken(): string | undefined {
+  const home = process.env.HOME;
+  if (!home) return undefined;
+  const credPath = `${home}/.linear/credentials/jojo.json`;
+  if (!existsSync(credPath)) return undefined;
+  try {
+    const data = JSON.parse(readFileSync(credPath, "utf8")) as {
+      accessToken?: string;
+    };
+    return data.accessToken;
+  } catch {
+    return undefined;
+  }
+}
+
+async function acknowledgeMention(action: RouterAction, api: OpenClawPluginApi): Promise<void> {
+  if (action.event !== "comment.mention" || !action.commentId) return;
+
+  const accessToken = readJojoAgentAccessToken();
+  if (!accessToken) {
+    api.logger.info("[linear] ACK skipped: jojo Linear credentials not found");
+    return;
+  }
+
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: accessToken,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `mutation($input: ReactionCreateInput!) {
+        reactionCreate(input: $input) { success reaction { id emoji } }
+      }`,
+      variables: {
+        input: {
+          emoji: "👀",
+          commentId: action.commentId,
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Linear ACK HTTP ${res.status}: ${await res.text()}`);
+  }
+
+  const json = (await res.json()) as { errors?: { message: string }[] };
+  if (json.errors?.length) {
+    throw new Error(`Linear ACK error: ${json.errors[0].message}`);
+  }
+}
+
 let activeDebouncer: { flushKey: (key: string) => Promise<void> } | undefined;
 const activeDebouncerKeys = new Set<string>();
 
@@ -136,7 +191,13 @@ export function activate(api: OpenClawPluginApi): void {
     api.logger.error("[linear] apiKey is not configured — plugin is inert");
     return;
   }
-  setApiKey(linearApiKey);
+  const jojoAgentAccessToken = readJojoAgentAccessToken();
+  setApiKey(jojoAgentAccessToken || linearApiKey);
+  if (jojoAgentAccessToken) {
+    api.logger.info("[linear] Linear GraphQL tools using jojo agent OAuth credentials");
+  } else {
+    api.logger.info("[linear] Linear GraphQL tools using plugin apiKey fallback");
+  }
 
   const webhookSecret = api.pluginConfig?.["webhookSecret"];
   if (typeof webhookSecret !== "string" || !webhookSecret) {
@@ -163,7 +224,9 @@ export function activate(api: OpenClawPluginApi): void {
   const core = api.runtime;
   const cfg = api.config;
 
-  const queuePath = api.resolvePath("queue/inbox.jsonl");
+  const queuePath = process.env.HOME
+    ? `${process.env.HOME}/.openclaw/openclaw-linear/queue/inbox.jsonl`
+    : api.resolvePath("queue/inbox.jsonl");
   const queue = new InboxQueue(queuePath);
 
   // Recover any stale in_progress items from a previous crash
@@ -277,8 +340,20 @@ export function activate(api: OpenClawPluginApi): void {
         );
 
         if (action.type === "wake") {
-          activeDebouncerKeys.add(action.agentId);
-          debouncer.enqueue(action);
+          acknowledgeMention(action, api).catch((err) => {
+            api.logger.error(
+              `[linear] ACK reaction failed: ${formatErrorMessage(err)}`,
+            );
+          });
+
+          // Dispatch immediately so Linear mentions feel responsive. The
+          // debouncer remains available for future batching, but @bot comments
+          // should wake the agent without waiting for the batch window.
+          dispatchConsolidatedActions([action], api, queue).catch((err) => {
+            api.logger.error(
+              `[linear] Immediate dispatch failed: ${formatErrorMessage(err)}`,
+            );
+          });
         }
 
         if (action.type === "notify") {
