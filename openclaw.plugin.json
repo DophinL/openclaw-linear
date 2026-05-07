@@ -19,6 +19,11 @@
         "sensitive": true,
         "description": "Webhook signing secret for HMAC verification"
       },
+      "webhookPath": {
+        "type": "string",
+        "description": "Gateway HTTP path for Linear webhook delivery. Avoid /hooks/* because OpenClaw built-in hooks handle that prefix first.",
+        "default": "/linear/webhook"
+      },
       "teamIds": {
         "type": "array",
         "items": {

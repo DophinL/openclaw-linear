@@ -377,8 +377,14 @@ export function activate(api: OpenClawPluginApi): void {
     },
   });
 
+  const routePath =
+    typeof api.pluginConfig?.["webhookPath"] === "string" &&
+    (api.pluginConfig["webhookPath"] as string).trim()
+      ? (api.pluginConfig["webhookPath"] as string).trim()
+      : "/linear/webhook";
+
   api.registerHttpRoute({
-    path: "/hooks/linear",
+    path: routePath,
     handler: async (req, res) => {
       await handler(req, res);
       return true;
@@ -387,7 +393,7 @@ export function activate(api: OpenClawPluginApi): void {
   });
 
   api.logger.info(
-    `Linear webhook handler registered at /hooks/linear (debounce: ${debounceMs}ms)`,
+    `Linear webhook handler registered at ${routePath} (debounce: ${debounceMs}ms)`,
   );
 }
 
