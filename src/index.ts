@@ -379,7 +379,10 @@ export function activate(api: OpenClawPluginApi): void {
 
   api.registerHttpRoute({
     path: "/hooks/linear",
-    handler,
+    handler: async (req, res) => {
+      await handler(req, res);
+      return true;
+    },
     auth: "plugin",
   });
 
