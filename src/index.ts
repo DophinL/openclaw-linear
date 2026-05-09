@@ -25,7 +25,14 @@ const EVENT_LABELS: Record<string, string> = {
   "issue.state_readded": "State Re-added",
   "issue.priority_changed": "Priority Changed",
   "comment.mention": "Mentioned",
+  "agent_session.created": "Agent Session Created",
+  "agent_session.prompted": "Agent Session Prompted",
 };
+
+type AgentActivityContent =
+  | { type: "thought"; body: string }
+  | { type: "response"; body: string }
+  | { type: "error"; body: string };
 
 export function formatConsolidatedMessage(actions: RouterAction[]): string {
   if (actions.length === 1) {
@@ -180,6 +187,129 @@ async function acknowledgeMention(action: RouterAction, api: OpenClawPluginApi):
   }
 }
 
+async function createAgentActivity(
+  agentSessionId: string,
+  content: AgentActivityContent,
+  api: OpenClawPluginApi,
+): Promise<void> {
+  const accessToken = readJojoAgentAccessToken();
+  if (!accessToken) {
+    api.logger.info("[linear] AgentActivity skipped: jojo Linear credentials not found");
+    return;
+  }
+
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: accessToken,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+        agentActivityCreate(input: $input) {
+          success
+          agentActivity { id }
+        }
+      }`,
+      variables: {
+        input: {
+          agentSessionId,
+          content,
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Linear AgentActivity HTTP ${res.status}: ${await res.text()}`);
+  }
+
+  const json = (await res.json()) as { errors?: { message: string }[] };
+  if (json.errors?.length) {
+    throw new Error(`Linear AgentActivity error: ${json.errors[0].message}`);
+  }
+}
+
+async function dispatchAgentSessionAction(
+  action: RouterAction,
+  api: OpenClawPluginApi,
+): Promise<void> {
+  if (!action.agentSessionId) return;
+
+  const core = api.runtime;
+  const cfg = api.config;
+  const startedBody = action.event === "agent_session.prompted"
+    ? "收到你的补充信息了，我继续处理。"
+    : "收到，我开始处理。";
+
+  await createAgentActivity(
+    action.agentSessionId,
+    { type: "thought", body: startedBody },
+    api,
+  );
+
+  const body = [
+    "You are responding to a Linear Agent Session.",
+    "",
+    `Issue: ${action.issueLabel}`,
+    `Agent session ID: ${action.agentSessionId}`,
+    "",
+    action.promptContext || action.detail,
+    "",
+    "Reply with the final answer for the Linear user. Do not use the linear_comment tool for this session; your final reply will be sent back as a Linear Agent Activity response.",
+  ].join("\n");
+
+  const ctx = core.channel.reply.finalizeInboundContext({
+    Body: body,
+    BodyForAgent: body,
+    RawBody: body,
+    CommandBody: body,
+    From: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
+    To: `${CHANNEL_ID}:${action.agentId}`,
+    SessionKey: `agent:${action.agentId}:linear-agent-session:${action.agentSessionId}`,
+    AccountId: "default",
+    ChatType: "direct",
+    ConversationLabel: `Linear Agent Session: ${action.issueLabel}`,
+    SenderId: action.linearUserId,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
+  });
+
+  let deliveredFinal = false;
+  await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload, info) => {
+        if (info.kind !== "final") return;
+        const text = payload.text?.trim();
+        if (!text || text === "NO_REPLY") return;
+        deliveredFinal = true;
+        await createAgentActivity(
+          action.agentSessionId!,
+          { type: payload.isError ? "error" : "response", body: text },
+          api,
+        );
+      },
+      onError: (err: unknown) => {
+        api.logger.error(
+          `[linear] Agent Session reply error: ${formatErrorMessage(err)}`,
+        );
+      },
+    },
+  });
+
+  if (!deliveredFinal) {
+    await createAgentActivity(
+      action.agentSessionId,
+      { type: "error", body: "我这边没有生成可发送的最终回复，请再试一次或直接在评论里补充信息。" },
+      api,
+    );
+  }
+}
+
 let activeDebouncer: { flushKey: (key: string) => Promise<void> } | undefined;
 const activeDebouncerKeys = new Set<string>();
 
@@ -312,6 +442,8 @@ export function activate(api: OpenClawPluginApi): void {
     eventFilter: eventFilter.length ? eventFilter : undefined,
     teamIds: teamIds.length ? teamIds : undefined,
     stateActions,
+    routeCommentMentions: api.pluginConfig?.["routeCommentMentions"] === true,
+    agentSessionAgentId: (api.pluginConfig?.["agentSessionAgentId"] as string | undefined) ?? "linear_jojo_agent",
   });
 
   const debouncer = api.runtime.channel.debounce.createInboundDebouncer<RouterAction>({
@@ -340,6 +472,24 @@ export function activate(api: OpenClawPluginApi): void {
         );
 
         if (action.type === "wake") {
+          if (action.agentSessionId) {
+            dispatchAgentSessionAction(action, api).catch((err) => {
+              api.logger.error(
+                `[linear] Agent Session dispatch failed: ${formatErrorMessage(err)}`,
+              );
+              createAgentActivity(
+                action.agentSessionId!,
+                { type: "error", body: `处理失败：${formatErrorMessage(err)}` },
+                api,
+              ).catch((activityErr) => {
+                api.logger.error(
+                  `[linear] Agent Session error activity failed: ${formatErrorMessage(activityErr)}`,
+                );
+              });
+            });
+            continue;
+          }
+
           acknowledgeMention(action, api).catch((err) => {
             api.logger.error(
               `[linear] ACK reaction failed: ${formatErrorMessage(err)}`,

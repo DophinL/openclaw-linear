@@ -1044,4 +1044,92 @@ describe("event-router", () => {
       expect(route(event)).toHaveLength(1);
     });
   });
+
+  describe("agent session events", () => {
+    it("routes created AgentSessionEvent to configured OpenClaw agent", () => {
+      const config = makeConfig({}, { agentSessionAgentId: "linear_jojo_agent" });
+      const route = createEventRouter(config);
+
+      const event: LinearWebhookPayload = {
+        type: "AgentSessionEvent",
+        action: "created",
+        data: {
+          appUserId: "app-user-1",
+          promptContext: "<issue identifier=\"YOU-1\"><title>Help</title></issue>",
+          agentSession: {
+            id: "session-1",
+            issue: {
+              id: "issue-1",
+              identifier: "YOU-1",
+              title: "Help",
+              priority: 2,
+            },
+            comment: { id: "comment-1" },
+          },
+        },
+        createdAt: new Date().toISOString(),
+      };
+
+      expect(route(event)).toEqual([
+        {
+          type: "wake",
+          agentId: "linear_jojo_agent",
+          event: "agent_session.created",
+          detail: "Linear Agent Session created on YOU-1: Help\n\n<issue identifier=\"YOU-1\"><title>Help</title></issue>",
+          issueId: "issue-1",
+          issueLabel: "YOU-1: Help",
+          identifier: "YOU-1",
+          issuePriority: 2,
+          linearUserId: "app-user-1",
+          commentId: "comment-1",
+          agentSessionId: "session-1",
+          promptContext: "<issue identifier=\"YOU-1\"><title>Help</title></issue>",
+        },
+      ]);
+    });
+
+    it("routes prompted AgentSessionEvent with prompt body", () => {
+      const config = makeConfig({ "app-user-1": "agent-1" });
+      const route = createEventRouter(config);
+
+      const event: LinearWebhookPayload = {
+        type: "AgentSessionEvent",
+        action: "prompted",
+        data: {
+          agentSession: {
+            id: "session-2",
+            issue: { id: "issue-2", identifier: "YOU-2" },
+          },
+          agentActivity: {
+            content: { type: "prompt", body: "继续" },
+          },
+        },
+        createdAt: new Date().toISOString(),
+      };
+
+      const actions = route(event);
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        type: "wake",
+        agentId: "agent-1",
+        event: "agent_session.prompted",
+        agentSessionId: "session-2",
+        detail: "Linear Agent Session prompted on YOU-2\n\n继续",
+      });
+    });
+
+    it("can disable legacy comment mention routing when AgentSession events are preferred", () => {
+      const config = makeConfig({ "user-1": "agent-1" }, { routeCommentMentions: false });
+      const route = createEventRouter(config);
+
+      const event: LinearWebhookPayload = {
+        type: "Comment",
+        action: "create",
+        data: { id: "comment-1", body: "@agent-1 hello", issue: { id: "issue-1" } },
+        createdAt: new Date().toISOString(),
+      };
+
+      expect(route(event)).toEqual([]);
+    });
+  });
 });

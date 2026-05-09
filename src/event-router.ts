@@ -12,6 +12,10 @@ export type RouterAction = {
   linearUserId: string;
   /** Comment ID for mention events — used as dedup key in the queue. */
   commentId?: string;
+  /** Linear Agent Session ID for official agent-session flows. */
+  agentSessionId?: string;
+  /** Frozen-in-time prompt context supplied by Linear for Agent Session runs. */
+  promptContext?: string;
 };
 
 export type StateAction = "add" | "remove" | "ignore";
@@ -25,6 +29,10 @@ export type EventRouterConfig = {
   eventFilter?: string[];
   teamIds?: string[];
   stateActions?: Record<string, string>;
+  /** Route legacy comment @mentions. Disable when app:mentionable AgentSession events are enabled. */
+  routeCommentMentions?: boolean;
+  /** Agent id to wake for official Linear AgentSessionEvent webhooks. */
+  agentSessionAgentId?: string;
 };
 
 export const DEFAULT_STATE_ACTIONS: Record<string, StateAction> = {
@@ -372,6 +380,10 @@ function handleComment(
   event: LinearWebhookPayload,
   config: EventRouterConfig,
 ): RouterAction[] {
+  if (config.routeCommentMentions === false) {
+    return [];
+  }
+
   const body = event.data.body as string | undefined;
   if (!body) {
     config.logger.info(
@@ -436,6 +448,85 @@ function handleComment(
   return actions;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function firstMappedAgentId(config: EventRouterConfig): string | undefined {
+  return Object.values(config.agentMapping)[0];
+}
+
+function resolveAgentSessionIssue(agentSession: Record<string, unknown> | undefined): {
+  issueId: string;
+  issueLabel: string;
+  identifier: string;
+  issuePriority: number;
+} {
+  const issue = asRecord(agentSession?.issue);
+  const issueId = String(issue?.id ?? "unknown");
+  const issueLabel = issue ? resolveIssueLabel(issue) : issueId;
+  const identifier = (issue?.identifier as string | undefined) ?? issueId;
+  const issuePriority = (issue?.priority as number | undefined) ?? 0;
+  return { issueId, issueLabel, identifier, issuePriority };
+}
+
+function extractPromptedBody(data: Record<string, unknown>): string | undefined {
+  const agentActivity = asRecord(data.agentActivity);
+  const content = asRecord(agentActivity?.content);
+  return (content?.body as string | undefined)
+    ?? (agentActivity?.body as string | undefined);
+}
+
+function handleAgentSessionEvent(
+  event: LinearWebhookPayload,
+  config: EventRouterConfig,
+): RouterAction[] {
+  if (event.action !== "created" && event.action !== "prompted") {
+    return [];
+  }
+
+  const agentSession = asRecord(event.data.agentSession);
+  const agentSessionId = String(agentSession?.id ?? event.data.agentSessionId ?? "");
+  if (!agentSessionId) {
+    config.logger.info("AgentSessionEvent missing agentSession.id — skipping");
+    return [];
+  }
+
+  const agentId = config.agentSessionAgentId ?? firstMappedAgentId(config);
+  if (!agentId) {
+    config.logger.info(`AgentSessionEvent ${agentSessionId} has no configured OpenClaw agent — skipping`);
+    return [];
+  }
+
+  const { issueId, issueLabel, identifier, issuePriority } = resolveAgentSessionIssue(agentSession);
+  const promptContext = (event.data.promptContext as string | undefined) ?? "";
+  const promptedBody = extractPromptedBody(event.data);
+  const commentId = String(asRecord(agentSession?.comment)?.id ?? "");
+
+  const detail = event.action === "prompted"
+    ? `Linear Agent Session prompted on ${issueLabel}\n\n${promptedBody ?? promptContext}`.trim()
+    : `Linear Agent Session created on ${issueLabel}\n\n${promptContext}`.trim();
+
+  return [
+    {
+      type: "wake",
+      agentId,
+      event: `agent_session.${event.action}`,
+      detail,
+      issueId,
+      issueLabel,
+      identifier,
+      issuePriority,
+      linearUserId: String(event.data.appUserId ?? agentSessionId),
+      commentId: commentId || undefined,
+      agentSessionId,
+      promptContext,
+    },
+  ];
+}
+
 export function createEventRouter(config: EventRouterConfig) {
   return function route(event: LinearWebhookPayload): RouterAction[] {
     // Apply event type filter
@@ -468,6 +559,10 @@ export function createEventRouter(config: EventRouterConfig) {
       (event.action === "create" || event.action === "update")
     ) {
       return handleComment(event, config);
+    }
+
+    if (event.type === "AgentSessionEvent") {
+      return handleAgentSessionEvent(event, config);
     }
 
     return [];
