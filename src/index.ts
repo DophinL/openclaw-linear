@@ -420,7 +420,7 @@ async function dispatchAgentSessionAction(
 let activeDebouncer: { flushKey: (key: string) => Promise<void> } | undefined;
 const activeDebouncerKeys = new Set<string>();
 
-export async function activate(api: OpenClawPluginApi): Promise<void> {
+export function activate(api: OpenClawPluginApi): void {
   api.logger.info("Linear plugin activated");
 
   const linearApiKey = api.pluginConfig?.["apiKey"];
@@ -428,16 +428,6 @@ export async function activate(api: OpenClawPluginApi): Promise<void> {
     api.logger.error("[linear] apiKey is not configured — plugin is inert");
     return;
   }
-  const jojoAgentAccessToken = await getValidAccessToken(api.logger);
-  setApiKey(jojoAgentAccessToken || linearApiKey);
-  if (jojoAgentAccessToken) {
-    api.logger.info("[linear] Linear GraphQL tools using jojo agent OAuth credentials");
-  } else {
-    api.logger.info("[linear] Linear GraphQL tools using plugin apiKey fallback");
-  }
-
-  // Schedule proactive token refresh every 20 hours
-  scheduleProactiveRefresh(api.logger);
 
   const webhookSecret = api.pluginConfig?.["webhookSecret"];
   if (typeof webhookSecret !== "string" || !webhookSecret) {
@@ -515,7 +505,7 @@ export async function activate(api: OpenClawPluginApi): Promise<void> {
       From: `${CHANNEL_ID}:${peerId}`,
       To: `${CHANNEL_ID}:${route.agentId ?? "default"}`,
       SessionKey: route.sessionKey,
-      AccountId: route.accountId ?? "default",
+      AccountId: route.accountId ?? "default" ,
       ChatType: "direct",
       ConversationLabel: `Linear: queue check (${remainingCount} remaining)`,
       SenderId: peerId,
@@ -571,6 +561,21 @@ export async function activate(api: OpenClawPluginApi): Promise<void> {
   });
   activeDebouncer = debouncer;
 
+  // Lazy init flag: ensures token refresh + scheduler run once
+  let initialized = false;
+  async function ensureInitialized(): Promise<void> {
+    if (initialized) return;
+    initialized = true;
+    const jojoAgentAccessToken = await getValidAccessToken(api.logger);
+    setApiKey((jojoAgentAccessToken ?? linearApiKey) as string);
+    if (jojoAgentAccessToken) {
+      api.logger.info("[linear] Linear GraphQL tools using jojo agent OAuth credentials");
+    } else {
+      api.logger.info("[linear] Linear GraphQL tools using plugin apiKey fallback");
+    }
+    scheduleProactiveRefresh(api.logger);
+  }
+
   const handler = createWebhookHandler({
     webhookSecret,
     logger: api.logger,
@@ -583,20 +588,23 @@ export async function activate(api: OpenClawPluginApi): Promise<void> {
 
         if (action.type === "wake") {
           if (action.agentSessionId) {
-            dispatchAgentSessionAction(action, api).catch((err) => {
-              api.logger.error(
-                `[linear] Agent Session dispatch failed: ${formatErrorMessage(err)}`,
-              );
-              createAgentActivity(
-                action.agentSessionId!,
-                { type: "error", body: `处理失败：${formatErrorMessage(err)}` },
-                api,
-              ).catch((activityErr) => {
+            // For agent sessions, ensure token is valid first (async lazy init)
+            ensureInitialized().then(() =>
+              dispatchAgentSessionAction(action, api).catch((err) => {
                 api.logger.error(
-                  `[linear] Agent Session error activity failed: ${formatErrorMessage(activityErr)}`,
+                  `[linear] Agent Session dispatch failed: ${formatErrorMessage(err)}`,
                 );
-              });
-            });
+                createAgentActivity(
+                  action.agentSessionId!,
+                  { type: "error", body: `处理失败：${formatErrorMessage(err)}` },
+                  api,
+                ).catch((activityErr) => {
+                  api.logger.error(
+                    `[linear] Agent Session error activity failed: ${formatErrorMessage(activityErr)}`,
+                  );
+                });
+              })
+            );
             continue;
           }
 
@@ -606,9 +614,6 @@ export async function activate(api: OpenClawPluginApi): Promise<void> {
             );
           });
 
-          // Dispatch immediately so Linear mentions feel responsive. The
-          // debouncer remains available for future batching, but @bot comments
-          // should wake the agent without waiting for the batch window.
           dispatchConsolidatedActions([action], api, queue).catch((err) => {
             api.logger.error(
               `[linear] Immediate dispatch failed: ${formatErrorMessage(err)}`,
@@ -646,6 +651,7 @@ export async function activate(api: OpenClawPluginApi): Promise<void> {
   api.registerHttpRoute({
     path: routePath,
     handler: async (req, res) => {
+      await ensureInitialized();
       await handler(req, res);
       return true;
     },
