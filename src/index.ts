@@ -1,6 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createEventRouter, type RouterAction } from "./event-router.js";
 import { InboxQueue, type EnqueueEntry } from "./work-queue.js";
@@ -15,6 +15,10 @@ import { createRelationTool } from "./tools/linear-relation-tool.js";
 const CHANNEL_ID = "linear";
 const DEFAULT_DEBOUNCE_MS = 30_000;
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+const LINEAR_OAUTH_URL = "https://api.linear.app/oauth/token";
+const CRED_PATH = `${process.env.HOME ?? ""}/.linear/credentials/jojo.json`;
+// Refresh when token expires in less than REFRESH_BEFORE_MS
+const REFRESH_BEFORE_MS = 3_600_000; // 1 hour;
 
 const EVENT_LABELS: Record<string, string> = {
   "issue.assigned": "Assigned",
@@ -33,6 +37,109 @@ type AgentActivityContent =
   | { type: "thought"; body: string }
   | { type: "response"; body: string }
   | { type: "error"; body: string };
+
+interface CredentialData {
+  accessToken: string;
+  refreshToken: string;
+  tokenExpiresAt: number;
+  clientId: string;
+  clientSecret: string;
+  scope: string;
+}
+
+/**
+ * Returns true if the token file exists and the token is still valid for at least `minValidMs`.
+ */
+function isTokenValid(minValidMs = REFRESH_BEFORE_MS): boolean {
+  if (!existsSync(CRED_PATH)) return false;
+  try {
+    const raw = JSON.parse(readFileSync(CRED_PATH, "utf8")) as { tokenExpiresAt?: number };
+    if (!raw.tokenExpiresAt) return false;
+    return Date.now() + minValidMs < raw.tokenExpiresAt;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Writes refreshed credentials back to the jojo.json file.
+ * Returns the new access token.
+ */
+async function refreshOAuthToken(cred: CredentialData, logger: { info: (m: string) => void; error: (m: string) => void }): Promise<string> {
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: cred.clientId,
+    client_secret: cred.clientSecret,
+    refresh_token: cred.refreshToken,
+    scope: cred.scope,
+  });
+
+  const res = await fetch(LINEAR_OAUTH_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`OAuth refresh HTTP ${res.status}: ${text}`);
+  }
+
+  const json = await res.json() as { access_token: string; refresh_token: string; expires_in: number };
+
+  const updated: CredentialData = {
+    ...cred,
+    accessToken: json.access_token,
+    refreshToken: json.refresh_token,
+    tokenExpiresAt: Date.now() + json.expires_in * 1000,
+  };
+
+  writeFileSync(CRED_PATH, JSON.stringify(updated, null, 2));
+  logger.info("[linear] OAuth token refreshed successfully");
+  return json.access_token;
+}
+
+/**
+ * Returns a valid access token, refreshing if necessary.
+ * Lazy: only refreshes when the token is missing or will expire within 1 hour.
+ */
+async function getValidAccessToken(logger: { info: (m: string) => void; error: (m: string) => void }): Promise<string | undefined> {
+  if (!existsSync(CRED_PATH)) return undefined;
+
+  try {
+    const cred: CredentialData = JSON.parse(readFileSync(CRED_PATH, "utf8"));
+    if (!cred.accessToken || !cred.refreshToken) return undefined;
+
+    // If token is still valid for at least 1 hour, return it directly
+    if (isTokenValid(REFRESH_BEFORE_MS)) {
+      return cred.accessToken;
+    }
+
+    // Token missing, expired, or about to expire — refresh
+    return await refreshOAuthToken(cred, logger);
+  } catch (err) {
+    logger.error(`[linear] getValidAccessToken error: ${formatErrorMessage(err)}`);
+    return undefined;
+  }
+}
+
+// --- Proactive refresh scheduler ---
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+function scheduleProactiveRefresh(logger: { info: (m: string) => void; error: (m: string) => void }): void {
+  if (refreshTimer) clearInterval(refreshTimer);
+  // Check and refresh every 20 hours (token is valid 24h)
+  refreshTimer = setInterval(async () => {
+    if (!isTokenValid(REFRESH_BEFORE_MS)) {
+      try {
+        const cred: CredentialData = JSON.parse(readFileSync(CRED_PATH, "utf8"));
+        await refreshOAuthToken(cred, logger);
+      } catch (err) {
+        logger.error(`[linear] Proactive token refresh failed: ${formatErrorMessage(err)}`);
+      }
+    }
+  }, 20 * 60 * 60 * 1000);
+}
 
 export function formatConsolidatedMessage(actions: RouterAction[]): string {
   if (actions.length === 1) {
@@ -152,7 +259,7 @@ function readJojoAgentAccessToken(): string | undefined {
 async function acknowledgeMention(action: RouterAction, api: OpenClawPluginApi): Promise<void> {
   if (action.event !== "comment.mention" || !action.commentId) return;
 
-  const accessToken = readJojoAgentAccessToken();
+  const accessToken = await getValidAccessToken(api.logger);
   if (!accessToken) {
     api.logger.info("[linear] ACK skipped: jojo Linear credentials not found");
     return;
@@ -192,7 +299,7 @@ async function createAgentActivity(
   content: AgentActivityContent,
   api: OpenClawPluginApi,
 ): Promise<void> {
-  const accessToken = readJojoAgentAccessToken();
+  const accessToken = await getValidAccessToken(api.logger);
   if (!accessToken) {
     api.logger.info("[linear] AgentActivity skipped: jojo Linear credentials not found");
     return;
@@ -313,7 +420,7 @@ async function dispatchAgentSessionAction(
 let activeDebouncer: { flushKey: (key: string) => Promise<void> } | undefined;
 const activeDebouncerKeys = new Set<string>();
 
-export function activate(api: OpenClawPluginApi): void {
+export async function activate(api: OpenClawPluginApi): Promise<void> {
   api.logger.info("Linear plugin activated");
 
   const linearApiKey = api.pluginConfig?.["apiKey"];
@@ -321,13 +428,16 @@ export function activate(api: OpenClawPluginApi): void {
     api.logger.error("[linear] apiKey is not configured — plugin is inert");
     return;
   }
-  const jojoAgentAccessToken = readJojoAgentAccessToken();
+  const jojoAgentAccessToken = await getValidAccessToken(api.logger);
   setApiKey(jojoAgentAccessToken || linearApiKey);
   if (jojoAgentAccessToken) {
     api.logger.info("[linear] Linear GraphQL tools using jojo agent OAuth credentials");
   } else {
     api.logger.info("[linear] Linear GraphQL tools using plugin apiKey fallback");
   }
+
+  // Schedule proactive token refresh every 20 hours
+  scheduleProactiveRefresh(api.logger);
 
   const webhookSecret = api.pluginConfig?.["webhookSecret"];
   if (typeof webhookSecret !== "string" || !webhookSecret) {

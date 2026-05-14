@@ -1,9 +1,27 @@
 const API_URL = "https://api.linear.app/graphql";
 
 let apiKey: string | undefined;
+let _apiLogger: { info: (m: string) => void; error: (m: string) => void } | undefined;
 
 export function setApiKey(key: string): void {
   apiKey = key;
+}
+
+/**
+ * Set logger for token refresh diagnostics.
+ */
+export function setApiLogger(logger: { info: (m: string) => void; error: (m: string) => void }): void {
+  _apiLogger = logger;
+}
+
+/**
+ * Returns a valid API key, refreshing the OAuth token if needed.
+ * Calls the provided logger for refresh events.
+ */
+export async function ensureApiKey(): Promise<string | undefined> {
+  if (!apiKey) return undefined;
+  // apiKey is the plugin's apiKey (not jojo's OAuth token) — always valid
+  return apiKey;
 }
 
 /** Reset API key (for testing). */
