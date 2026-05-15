@@ -1,6 +1,8 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { extname, join } from "node:path";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createEventRouter, type RouterAction } from "./event-router.js";
 import { InboxQueue, type EnqueueEntry } from "./work-queue.js";
@@ -17,8 +19,12 @@ const DEFAULT_DEBOUNCE_MS = 30_000;
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 const LINEAR_OAUTH_URL = "https://api.linear.app/oauth/token";
 const CRED_PATH = `${process.env.HOME ?? ""}/.linear/credentials/jojo.json`;
+const AGENT_MEDIA_DIR = `${process.env.HOME ?? ""}/.openclaw/openclaw-linear/media`;
 // Refresh when token expires in less than REFRESH_BEFORE_MS
 const REFRESH_BEFORE_MS = 3_600_000; // 1 hour;
+const PUBLIC_FILE_URLS_EXPIRE_SECONDS = 10 * 60;
+const MAX_AGENT_SESSION_MEDIA = 8;
+const MAX_LINEAR_FILE_BYTES = 20 * 1024 * 1024;
 
 const EVENT_LABELS: Record<string, string> = {
   "issue.assigned": "Assigned",
@@ -37,6 +43,38 @@ type AgentActivityContent =
   | { type: "thought"; body: string }
   | { type: "response"; body: string }
   | { type: "error"; body: string };
+
+type AgentSessionContext = {
+  conversationText: string;
+  mediaPaths: string[];
+  mediaTypes: string[];
+};
+
+type AgentActivityNode = {
+  updatedAt?: string;
+  createdAt?: string;
+  content?: Record<string, unknown>;
+};
+
+type AgentSessionQueryResult = {
+  agentSession?: {
+    issue?: {
+      id?: string;
+      identifier?: string;
+      title?: string;
+      team?: { id?: string } | null;
+      state?: { type?: string } | null;
+      delegate?: { id?: string } | null;
+      attachments?: {
+        nodes?: { url?: string; title?: string; metadata?: unknown }[];
+      } | null;
+    } | null;
+    activities?: {
+      edges?: { node?: AgentActivityNode | null }[];
+      nodes?: AgentActivityNode[];
+    } | null;
+  } | null;
+};
 
 interface CredentialData {
   accessToken: string;
@@ -121,6 +159,38 @@ async function getValidAccessToken(logger: { info: (m: string) => void; error: (
     logger.error(`[linear] getValidAccessToken error: ${formatErrorMessage(err)}`);
     return undefined;
   }
+}
+
+async function linearGraphql<T>(
+  accessToken: string,
+  query: string,
+  variables?: Record<string, unknown>,
+): Promise<T> {
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: accessToken,
+      "Content-Type": "application/json",
+      // Linear private upload URLs in GraphQL responses can be signed for
+      // temporary server-side reads. We still send Authorization when
+      // downloading as a fallback for unsigned uploads.linear.app URLs.
+      "public-file-urls-expire-in": String(PUBLIC_FILE_URLS_EXPIRE_SECONDS),
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Linear GraphQL HTTP ${res.status}: ${await res.text()}`);
+  }
+
+  const json = (await res.json()) as {
+    data?: T;
+    errors?: { message: string }[];
+  };
+  if (json.errors?.length) {
+    throw new Error(`Linear GraphQL error: ${json.errors[0].message}`);
+  }
+  return json.data as T;
 }
 
 // --- Proactive refresh scheduler ---
@@ -337,6 +407,250 @@ async function createAgentActivity(
   }
 }
 
+function contentBody(content: Record<string, unknown> | undefined): string | undefined {
+  const body = content?.body;
+  return typeof body === "string" && body.trim() ? body : undefined;
+}
+
+function flattenActivityNodes(
+  activities: NonNullable<AgentSessionQueryResult["agentSession"]>["activities"] | undefined,
+): AgentActivityNode[] {
+  if (!activities || typeof activities !== "object") return [];
+  const a = activities;
+  if (Array.isArray(a?.nodes)) return a.nodes.filter(Boolean);
+  if (Array.isArray(a?.edges)) {
+    return a.edges.map((edge) => edge.node).filter((node): node is AgentActivityNode => Boolean(node));
+  }
+  return [];
+}
+
+function formatAgentActivities(nodes: AgentActivityNode[]): string {
+  const lines: string[] = [];
+  for (const node of nodes) {
+    const content = node.content;
+    if (!content || typeof content !== "object") continue;
+    const typename = typeof content.__typename === "string" ? content.__typename : "AgentActivity";
+    const body = contentBody(content);
+    if (!body) continue;
+    const label = typename.replace(/^AgentActivity/, "").replace(/Content$/, "") || "Activity";
+    const at = node.updatedAt ?? node.createdAt;
+    lines.push(`- ${at ? `[${at}] ` : ""}${label}: ${body}`);
+  }
+  return lines.join("\n");
+}
+
+function collectStrings(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+  } else if (value && typeof value === "object") {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+  return out;
+}
+
+function extractLinearUploadUrls(...values: unknown[]): string[] {
+  const urls = new Set<string>();
+  const urlRegex = /https:\/\/uploads\.linear\.app\/[^\s)\]}>"']+/g;
+  for (const value of values) {
+    for (const text of collectStrings(value)) {
+      for (const match of text.matchAll(urlRegex)) {
+        urls.add(match[0].replace(/[.,;:]+$/, ""));
+      }
+    }
+  }
+  return [...urls];
+}
+
+function extensionForContentType(contentType: string | null, url: string): string {
+  const fromUrl = extname(new URL(url).pathname);
+  if (fromUrl && fromUrl.length <= 10) return fromUrl;
+  const type = (contentType ?? "").split(";", 1)[0].trim().toLowerCase();
+  if (type === "image/jpeg") return ".jpg";
+  if (type === "image/png") return ".png";
+  if (type === "image/webp") return ".webp";
+  if (type === "image/gif") return ".gif";
+  if (type === "application/pdf") return ".pdf";
+  if (type === "text/plain") return ".txt";
+  return ".bin";
+}
+
+async function downloadLinearFile(
+  url: string,
+  accessToken: string,
+  logger: { info: (m: string) => void; error: (m: string) => void },
+): Promise<{ path: string; mediaType: string } | undefined> {
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: accessToken },
+    });
+    if (!res.ok) {
+      logger.error(`[linear] Failed to download attachment ${url}: HTTP ${res.status}`);
+      return undefined;
+    }
+
+    const contentLength = Number(res.headers.get("content-length") ?? "0");
+    if (Number.isFinite(contentLength) && contentLength > MAX_LINEAR_FILE_BYTES) {
+      logger.error(`[linear] Skipping oversized attachment ${url}: ${contentLength} bytes`);
+      return undefined;
+    }
+
+    const contentType = res.headers.get("content-type") ?? "application/octet-stream";
+    const arrayBuffer = await res.arrayBuffer();
+    if (arrayBuffer.byteLength > MAX_LINEAR_FILE_BYTES) {
+      logger.error(`[linear] Skipping oversized attachment ${url}: ${arrayBuffer.byteLength} bytes`);
+      return undefined;
+    }
+
+    mkdirSync(AGENT_MEDIA_DIR, { recursive: true });
+    const hash = createHash("sha256").update(url).digest("hex").slice(0, 16);
+    const ext = extensionForContentType(contentType, url);
+    const path = join(AGENT_MEDIA_DIR, `${hash}${ext}`);
+    writeFileSync(path, Buffer.from(arrayBuffer));
+    return { path, mediaType: contentType };
+  } catch (err) {
+    logger.error(`[linear] Attachment download error: ${formatErrorMessage(err)}`);
+    return undefined;
+  }
+}
+
+async function fetchAgentSessionContext(
+  action: RouterAction,
+  accessToken: string,
+  api: OpenClawPluginApi,
+): Promise<AgentSessionContext> {
+  const data = await linearGraphql<AgentSessionQueryResult>(
+    accessToken,
+    `query AgentSessionContext($id: String!) {
+      agentSession(id: $id) {
+        issue {
+          id
+          identifier
+          title
+          team { id }
+          state { type }
+          delegate { id }
+          attachments { nodes { url title metadata } }
+        }
+        activities {
+          edges {
+            node {
+              updatedAt
+              content {
+                __typename
+                ... on AgentActivityThoughtContent { body }
+                ... on AgentActivityActionContent { action parameter result }
+                ... on AgentActivityElicitationContent { body }
+                ... on AgentActivityResponseContent { body }
+                ... on AgentActivityErrorContent { body }
+                ... on AgentActivityPromptContent { body }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { id: action.agentSessionId },
+  );
+
+  const activityText = formatAgentActivities(flattenActivityNodes(data.agentSession?.activities));
+  const issueAttachments = data.agentSession?.issue?.attachments?.nodes ?? [];
+  const uploadUrls = extractLinearUploadUrls(
+    action.promptContext,
+    action.detail,
+    data.agentSession?.activities,
+    issueAttachments,
+  ).slice(0, MAX_AGENT_SESSION_MEDIA);
+
+  const mediaPaths: string[] = [];
+  const mediaTypes: string[] = [];
+  for (const url of uploadUrls) {
+    const downloaded = await downloadLinearFile(url, accessToken, api.logger);
+    if (!downloaded) continue;
+    mediaPaths.push(downloaded.path);
+    mediaTypes.push(downloaded.mediaType);
+  }
+
+  const attachmentList = issueAttachments
+    .filter((attachment) => attachment.url)
+    .map((attachment) => `- ${attachment.title ?? "Attachment"}: ${attachment.url}`)
+    .join("\n");
+
+  const conversationText = [
+    action.promptContext || action.detail,
+    activityText ? `Agent activity history (frozen user/agent messages):\n${activityText}` : "",
+    attachmentList ? `Issue attachments:\n${attachmentList}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  return { conversationText, mediaPaths, mediaTypes };
+}
+
+async function alignIssueWithAgentBestPractices(
+  action: RouterAction,
+  accessToken: string,
+  api: OpenClawPluginApi,
+): Promise<void> {
+  if (!action.agentSessionId) return;
+  try {
+    const data = await linearGraphql<AgentSessionQueryResult>(
+      accessToken,
+      `query AgentSessionIssue($id: String!) {
+        agentSession(id: $id) {
+          issue {
+            id
+            team { id }
+            state { type }
+            delegate { id }
+          }
+        }
+      }`,
+      { id: action.agentSessionId },
+    );
+    const issue = data.agentSession?.issue;
+    const issueId = issue?.id;
+    const teamId = issue?.team?.id;
+    if (!issueId || !teamId) return;
+
+    const input: Record<string, unknown> = {};
+    const stateType = issue.state?.type;
+    if (stateType !== "started" && stateType !== "completed" && stateType !== "canceled") {
+      const stateData = await linearGraphql<{
+        team?: { states?: { nodes?: { id: string; position?: number }[] } };
+      }>(
+        accessToken,
+        `query TeamStartedStatuses($teamId: String!) {
+          team(id: $teamId) {
+            states(filter: { type: { eq: "started" } }) {
+              nodes { id position }
+            }
+          }
+        }`,
+        { teamId },
+      );
+      const started = (stateData.team?.states?.nodes ?? [])
+        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))[0];
+      if (started?.id) input.stateId = started.id;
+    }
+
+    if (!issue.delegate?.id) {
+      input.delegateId = action.linearUserId;
+    }
+
+    if (Object.keys(input).length === 0) return;
+    await linearGraphql(
+      accessToken,
+      `mutation UpdateIssueForAgent($id: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $id, input: $input) { success }
+      }`,
+      { id: issueId, input },
+    );
+  } catch (err) {
+    // Best-practice alignment should not block the agent from replying.
+    api.logger.error(`[linear] Best-practice issue alignment skipped: ${formatErrorMessage(err)}`);
+  }
+}
+
 async function dispatchAgentSessionAction(
   action: RouterAction,
   api: OpenClawPluginApi,
@@ -345,6 +659,11 @@ async function dispatchAgentSessionAction(
 
   const core = api.runtime;
   const cfg = api.config;
+  const accessToken = await getValidAccessToken(api.logger);
+  if (!accessToken) {
+    api.logger.info("[linear] Agent Session skipped: jojo Linear credentials not found");
+    return;
+  }
   const startedBody = action.event === "agent_session.prompted"
     ? "收到你的补充信息了，我继续处理。"
     : "收到，我开始处理。";
@@ -355,13 +674,29 @@ async function dispatchAgentSessionAction(
     api,
   );
 
+  alignIssueWithAgentBestPractices(action, accessToken, api).catch((err) => {
+    api.logger.error(`[linear] Best-practice alignment failed: ${formatErrorMessage(err)}`);
+  });
+
+  const sessionContext = await fetchAgentSessionContext(action, accessToken, api).catch((err) => {
+    api.logger.error(`[linear] Agent Session context fetch failed: ${formatErrorMessage(err)}`);
+    return {
+      conversationText: action.promptContext || action.detail,
+      mediaPaths: [],
+      mediaTypes: [],
+    } satisfies AgentSessionContext;
+  });
+
   const body = [
     "You are responding to a Linear Agent Session.",
     "",
     `Issue: ${action.issueLabel}`,
     `Agent session ID: ${action.agentSessionId}`,
     "",
-    action.promptContext || action.detail,
+    sessionContext.conversationText,
+    sessionContext.mediaPaths.length > 0
+      ? `Attached Linear file(s) have been downloaded and provided as media inputs: ${sessionContext.mediaPaths.map((p) => p.split("/").pop()).join(", ")}`
+      : "",
     "",
     "Reply with the final answer for the Linear user. Do not use the linear_comment tool for this session; your final reply will be sent back as a Linear Agent Activity response.",
   ].join("\n");
@@ -371,6 +706,14 @@ async function dispatchAgentSessionAction(
     BodyForAgent: body,
     RawBody: body,
     CommandBody: body,
+    ...(sessionContext.mediaPaths.length > 0
+      ? {
+          MediaPaths: sessionContext.mediaPaths,
+          MediaPath: sessionContext.mediaPaths[0],
+          MediaTypes: sessionContext.mediaTypes,
+          MediaType: sessionContext.mediaTypes[0],
+        }
+      : {}),
     From: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
     To: `${CHANNEL_ID}:${action.agentId}`,
     SessionKey: `agent:${action.agentId}:linear-agent-session:${action.agentSessionId}`,
