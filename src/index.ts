@@ -924,6 +924,11 @@ export function activate(api: OpenClawPluginApi): void {
     logger: api.logger,
     onEvent: (event) => {
       const actions = routeEvent(event);
+      if (actions.length === 0) {
+        api.logger.info(
+          `[event-router] no actions for ${event.action} ${event.type} (${String(event.data.id ?? event.data.agentSessionId ?? "unknown")})`,
+        );
+      }
       for (const action of actions) {
         api.logger.info(
           `[event-router] ${action.type} agent=${action.agentId} event=${action.event}: ${action.detail}`,

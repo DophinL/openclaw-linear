@@ -93,9 +93,23 @@ export function createWebhookHandler(deps: WebhookHandlerDeps) {
     }
 
     const signature = req.headers["linear-signature"];
+    const deliveryId = req.headers["linear-delivery"] as string | undefined;
+    const signatureString = typeof signature === "string" ? signature : undefined;
     const secrets = Array.isArray(deps.webhookSecret) ? deps.webhookSecret : [deps.webhookSecret];
-    const signatureValid = typeof signature === "string" && secrets.some((s) => verifySignature(rawBody, signature, s));
+    const signatureValid = signatureString !== undefined && secrets.some((s) => verifySignature(rawBody, signatureString, s));
     if (!signatureValid) {
+      deps.logger.error(
+        [
+          "[linear] Invalid webhook signature",
+          `delivery=${deliveryId ?? "missing"}`,
+          `hasSignature=${signatureString !== undefined}`,
+          `signatureLength=${signatureString?.length ?? 0}`,
+          `bodyBytes=${Buffer.byteLength(rawBody)}`,
+          `method=${req.method ?? "unknown"}`,
+          `url=${req.url ?? "unknown"}`,
+          `userAgent=${String(req.headers["user-agent"] ?? "unknown")}`,
+        ].join(" "),
+      );
       res.writeHead(400);
       res.end("Invalid signature");
       return;
@@ -104,7 +118,6 @@ export function createWebhookHandler(deps: WebhookHandlerDeps) {
     let event: LinearWebhookPayload;
     try {
       const payload = JSON.parse(rawBody) as Record<string, unknown>;
-      const deliveryId = req.headers["linear-delivery"] as string | undefined;
 
       // Prune expired entries periodically
       pruneDeliveries();
