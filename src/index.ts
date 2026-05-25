@@ -1,7 +1,14 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { extname, join } from "node:path";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createEventRouter, type RouterAction } from "./event-router.js";
@@ -25,6 +32,7 @@ const REFRESH_BEFORE_MS = 3_600_000; // 1 hour;
 const PUBLIC_FILE_URLS_EXPIRE_SECONDS = 10 * 60;
 const MAX_AGENT_SESSION_MEDIA = 8;
 const MAX_LINEAR_FILE_BYTES = 20 * 1024 * 1024;
+const AGENT_SESSION_FINAL_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
 
 const EVENT_LABELS: Record<string, string> = {
   "issue.assigned": "Assigned",
@@ -407,6 +415,135 @@ async function createAgentActivity(
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function collectRecentCodexSessionFiles(root: string, sinceMs: number): string[] {
+  const files: { path: string; mtimeMs: number }[] = [];
+  const stack = [root];
+
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (!dir) continue;
+
+    let entries: { name: string; isDirectory: () => boolean; isFile: () => boolean }[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+
+      try {
+        const stat = statSync(fullPath);
+        if (stat.mtimeMs >= sinceMs) {
+          files.push({ path: fullPath, mtimeMs: stat.mtimeMs });
+        }
+      } catch {}
+    }
+  }
+
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).map((file) => file.path);
+}
+
+function extractFinalTextFromCodexLog(content: string): string | undefined {
+  let finalText: string | undefined;
+
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const record = event as {
+      type?: string;
+      payload?: {
+        type?: string;
+        phase?: string;
+        message?: string;
+        content?: { type?: string; text?: string }[];
+      };
+    };
+
+    if (
+      record.type === "event_msg" &&
+      record.payload?.type === "agent_message" &&
+      record.payload.phase === "final_answer" &&
+      typeof record.payload.message === "string"
+    ) {
+      const text = record.payload.message.trim();
+      if (text && text !== "NO_REPLY") finalText = text;
+      continue;
+    }
+
+    if (
+      record.type === "response_item" &&
+      record.payload?.type === "message" &&
+      record.payload.phase === "final_answer" &&
+      Array.isArray(record.payload.content)
+    ) {
+      const text = record.payload.content
+        .filter((item) => item.type === "output_text" && typeof item.text === "string")
+        .map((item) => item.text)
+        .join("")
+        .trim();
+      if (text && text !== "NO_REPLY") finalText = text;
+    }
+  }
+
+  return finalText;
+}
+
+async function recoverAgentSessionFinalFromLogs(
+  action: RouterAction,
+  startedAtMs: number,
+  api: OpenClawPluginApi,
+): Promise<string | undefined> {
+  const root = join(
+    process.env.HOME ?? "",
+    ".openclaw",
+    "agents",
+    action.agentId,
+    "agent",
+    "codex-home",
+    "sessions",
+  );
+  const sinceMs = Math.max(0, startedAtMs - AGENT_SESSION_FINAL_RECOVERY_WINDOW_MS);
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    for (const file of collectRecentCodexSessionFiles(root, sinceMs)) {
+      let content = "";
+      try {
+        content = readFileSync(file, "utf-8");
+      } catch {
+        continue;
+      }
+      if (!content.includes(action.agentSessionId ?? "")) continue;
+
+      const text = extractFinalTextFromCodexLog(content);
+      if (text) {
+        api.logger.info(`[linear] recovered Agent Session final from Codex log: ${file}`);
+        return text;
+      }
+    }
+    await sleep(500);
+  }
+
+  return undefined;
+}
+
 function contentBody(content: Record<string, unknown> | undefined): string | undefined {
   const body = content?.body;
   return typeof body === "string" && body.trim() ? body : undefined;
@@ -728,9 +865,17 @@ async function dispatchAgentSessionAction(
   });
 
   let deliveredFinal = false;
+  const dispatchStartedAtMs = Date.now();
+  const agentSessionReplyOptions = {
+    sourceReplyDeliveryMode: "automatic",
+  } as unknown as NonNullable<
+    Parameters<typeof core.channel.reply.dispatchReplyWithBufferedBlockDispatcher>[0]["replyOptions"]
+  >;
+
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx,
     cfg,
+    replyOptions: agentSessionReplyOptions,
     dispatcherOptions: {
       deliver: async (payload, info) => {
         if (info.kind !== "final") return;
@@ -752,6 +897,20 @@ async function dispatchAgentSessionAction(
   });
 
   if (!deliveredFinal) {
+    const recoveredFinal = await recoverAgentSessionFinalFromLogs(
+      action,
+      dispatchStartedAtMs,
+      api,
+    );
+    if (recoveredFinal) {
+      await createAgentActivity(
+        action.agentSessionId,
+        { type: "response", body: recoveredFinal },
+        api,
+      );
+      return;
+    }
+
     await createAgentActivity(
       action.agentSessionId,
       { type: "error", body: "我这边没有生成可发送的最终回复，请再试一次或直接在评论里补充信息。" },
