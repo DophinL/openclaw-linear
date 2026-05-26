@@ -1,0 +1,19 @@
+name = "jojo-linear-agent"
+main = "src/index.js"
+compatibility_date = "2026-05-26"
+
+routes = [
+  { pattern = "jojo-linear-agent.youmind.ai/linear/*", zone_name = "youmind.ai" }
+]
+
+[[durable_objects.bindings]]
+name = "LINEAR_RELAY"
+class_name = "LinearAgentRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LinearAgentRelay"]
+
+[observability]
+enabled = true
+

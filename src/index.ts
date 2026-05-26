@@ -33,6 +33,8 @@ const PUBLIC_FILE_URLS_EXPIRE_SECONDS = 10 * 60;
 const MAX_AGENT_SESSION_MEDIA = 8;
 const MAX_LINEAR_FILE_BYTES = 20 * 1024 * 1024;
 const AGENT_SESSION_FINAL_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
+const AGENT_SESSION_FINAL_RECOVERY_ATTEMPTS = 300;
+const AGENT_SESSION_FINAL_RECOVERY_INTERVAL_MS = 2_000;
 
 const EVENT_LABELS: Record<string, string> = {
   "issue.assigned": "Assigned",
@@ -522,7 +524,7 @@ async function recoverAgentSessionFinalFromLogs(
   );
   const sinceMs = Math.max(0, startedAtMs - AGENT_SESSION_FINAL_RECOVERY_WINDOW_MS);
 
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  for (let attempt = 0; attempt < AGENT_SESSION_FINAL_RECOVERY_ATTEMPTS; attempt += 1) {
     for (const file of collectRecentCodexSessionFiles(root, sinceMs)) {
       let content = "";
       try {
@@ -538,7 +540,7 @@ async function recoverAgentSessionFinalFromLogs(
         return text;
       }
     }
-    await sleep(500);
+    await sleep(AGENT_SESSION_FINAL_RECOVERY_INTERVAL_MS);
   }
 
   return undefined;

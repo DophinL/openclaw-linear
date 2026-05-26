@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.linear-agent-ws-relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/jaredliu/clawd/skills/openclaw-linear/scripts/linear-agent-ws-client.mjs</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/jaredliu</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>LINEAR_RELAY_URL</key>
+    <string>wss://jojo-linear-agent.youmind.ai/linear/connect</string>
+    <key>LINEAR_RELAY_TOKEN_FILE</key>
+    <string>/Users/jaredliu/.openclaw/openclaw-linear/relay-token</string>
+    <key>LINEAR_LOCAL_WEBHOOK_URL</key>
+    <string>http://127.0.0.1:18789/linear/webhook</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/myopenclaw/linear-agent/ws-relay.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/myopenclaw/linear-agent/ws-relay.err</string>
+</dict>
+</plist>
+
