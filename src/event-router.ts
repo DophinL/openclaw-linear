@@ -465,7 +465,9 @@ function resolveAgentSessionIssue(agentSession: Record<string, unknown> | undefi
   issuePriority: number;
 } {
   const issue = asRecord(agentSession?.issue);
-  const issueId = String(issue?.id ?? "unknown");
+  const agentSessionId = String(agentSession?.id ?? "unknown");
+  const fallbackId = agentSessionId !== "unknown" ? `agent-session:${agentSessionId}` : "unknown";
+  const issueId = String(issue?.id ?? fallbackId);
   const issueLabel = issue ? resolveIssueLabel(issue) : issueId;
   const identifier = (issue?.identifier as string | undefined) ?? issueId;
   const issuePriority = (issue?.priority as number | undefined) ?? 0;
@@ -483,11 +485,12 @@ function handleAgentSessionEvent(
   event: LinearWebhookPayload,
   config: EventRouterConfig,
 ): RouterAction[] {
-  if (event.action !== "created" && event.action !== "prompted") {
+  const normalizedAction = event.action === "create" ? "created" : event.action;
+  if (normalizedAction !== "created" && normalizedAction !== "prompted") {
     return [];
   }
 
-  const agentSession = asRecord(event.data.agentSession);
+  const agentSession = asRecord(event.data.agentSession) ?? asRecord(event.data);
   const agentSessionId = String(agentSession?.id ?? event.data.agentSessionId ?? "");
   if (!agentSessionId) {
     config.logger.info("AgentSessionEvent missing agentSession.id — skipping");
@@ -505,7 +508,7 @@ function handleAgentSessionEvent(
   const promptedBody = extractPromptedBody(event.data);
   const commentId = String(asRecord(agentSession?.comment)?.id ?? "");
 
-  const detail = event.action === "prompted"
+  const detail = normalizedAction === "prompted"
     ? `Linear Agent Session prompted on ${issueLabel}\n\n${promptedBody ?? promptContext}`.trim()
     : `Linear Agent Session created on ${issueLabel}\n\n${promptContext}`.trim();
 
@@ -513,7 +516,7 @@ function handleAgentSessionEvent(
     {
       type: "wake",
       agentId,
-      event: `agent_session.${event.action}`,
+      event: `agent_session.${normalizedAction}`,
       detail,
       issueId,
       issueLabel,
@@ -561,7 +564,7 @@ export function createEventRouter(config: EventRouterConfig) {
       return handleComment(event, config);
     }
 
-    if (event.type === "AgentSessionEvent") {
+    if (event.type === "AgentSessionEvent" || event.type === "AgentSession") {
       return handleAgentSessionEvent(event, config);
     }
 

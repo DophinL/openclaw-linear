@@ -1118,6 +1118,34 @@ describe("event-router", () => {
       });
     });
 
+    it("routes OAuth App AgentSession create payloads", () => {
+      const config = makeConfig({}, { agentSessionAgentId: "linear_jojo_agent" });
+      const route = createEventRouter(config);
+
+      const event: LinearWebhookPayload = {
+        type: "AgentSession",
+        action: "create",
+        data: {
+          id: "session-3",
+          promptContext: "<issue identifier=\"YOU-3\"><title>OAuth app session</title></issue>",
+        },
+        createdAt: new Date().toISOString(),
+      };
+
+      expect(route(event)).toEqual([
+        expect.objectContaining({
+          type: "wake",
+          agentId: "linear_jojo_agent",
+          event: "agent_session.created",
+          issueId: "agent-session:session-3",
+          issueLabel: "agent-session:session-3",
+          identifier: "agent-session:session-3",
+          agentSessionId: "session-3",
+          promptContext: "<issue identifier=\"YOU-3\"><title>OAuth app session</title></issue>",
+        }),
+      ]);
+    });
+
     it("can disable legacy comment mention routing when AgentSession events are preferred", () => {
       const config = makeConfig({ "user-1": "agent-1" }, { routeCommentMentions: false });
       const route = createEventRouter(config);
