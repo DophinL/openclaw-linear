@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.linear-agent-worker-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jaredliu/clawd/skills/openclaw-linear/scripts/linear-agent-worker-watchdog.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/jaredliu</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>LINEAR_RELAY_TOKEN_FILE</key>
+    <string>/Users/jaredliu/.openclaw/openclaw-linear/relay-token</string>
+    <key>LINEAR_WORKER_STATUS_URL</key>
+    <string>https://jojo-linear-agent.youmind.ai/linear/status</string>
+    <key>LINEAR_WORKER_WEBHOOK_URL</key>
+    <string>https://jojo-linear-agent.youmind.ai/linear/webhook</string>
+    <key>LINEAR_LOCAL_WEBHOOK_URL</key>
+    <string>http://127.0.0.1:18789/linear/webhook</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/myopenclaw/linear-agent/worker-watchdog.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/myopenclaw/linear-agent/worker-watchdog.stderr.log</string>
+</dict>
+</plist>

@@ -8,7 +8,9 @@ webhooks.
 1. Linear sends `POST /linear/webhook` to Cloudflare Worker.
 2. Worker verifies `linear-signature` with `LINEAR_WEBHOOK_SECRET`.
 3. Worker stores the raw webhook envelope in the Durable Object queue and
-   returns `200 OK` immediately.
+   returns `200 OK` immediately. If Durable Object enqueue temporarily fails,
+   the Worker logs the failure, schedules one async retry, and still returns a
+   `202` so Linear does not automatically disable webhook delivery.
 4. The local Mac runs `scripts/linear-agent-ws-client.mjs`, which maintains an
    outbound WebSocket to `/linear/connect`.
 5. The Durable Object pushes queued webhook envelopes to the local client.
@@ -67,3 +69,21 @@ Logs:
 /tmp/myopenclaw/linear-agent/ws-relay.err
 ```
 
+## Worker Watchdog
+
+Install the Worker watchdog to monitor the production route, Durable Object
+queue, and local relay:
+
+```bash
+cp ~/clawd/skills/openclaw-linear/launchd/ai.openclaw.linear-agent-worker-watchdog.plist.template \
+  ~/Library/LaunchAgents/ai.openclaw.linear-agent-worker-watchdog.plist
+launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.linear-agent-worker-watchdog.plist
+launchctl kickstart -k gui/501/ai.openclaw.linear-agent-worker-watchdog
+```
+
+Logs:
+
+```text
+/tmp/myopenclaw/linear-agent/worker-watchdog.log
+/tmp/myopenclaw/linear-agent/worker-watchdog.stderr.log
+```

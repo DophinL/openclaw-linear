@@ -132,7 +132,7 @@ function summarizeQueueItem(item) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/linear/webhook") {
@@ -170,17 +170,50 @@ export default {
         attempts: 0,
       };
 
-      const response = await relayStub(env).fetch("https://linear-relay/enqueue", {
-        method: "POST",
-        body: JSON.stringify(envelope),
-        headers: { "content-type": "application/json" },
-      });
+      try {
+        const response = await relayStub(env).fetch("https://linear-relay/enqueue", {
+          method: "POST",
+          body: JSON.stringify(envelope),
+          headers: { "content-type": "application/json" },
+        });
 
-      if (!response.ok) {
-        return textResponse("Relay enqueue failed", 500);
+        if (response.ok) {
+          return textResponse("OK");
+        }
+
+        const failureBody = await response.text().catch(() => "");
+        console.error("[linear-webhook] relay enqueue failed", {
+          status: response.status,
+          deliveryId,
+          body: failureBody.slice(0, 500),
+        });
+      } catch (err) {
+        console.error("[linear-webhook] relay enqueue exception", {
+          deliveryId,
+          error: err instanceof Error ? err.stack : String(err),
+        });
       }
 
-      return textResponse("OK");
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(
+          relayStub(env)
+            .fetch("https://linear-relay/enqueue", {
+              method: "POST",
+              body: JSON.stringify(envelope),
+              headers: { "content-type": "application/json" },
+            })
+            .catch((err) => {
+              console.error("[linear-webhook] async enqueue retry failed", {
+                deliveryId,
+                error: err instanceof Error ? err.stack : String(err),
+              });
+            }),
+        );
+      }
+
+      return textResponse("Accepted; enqueue retry scheduled", 202, {
+        "x-openclaw-linear-enqueue": "retry-scheduled",
+      });
     }
 
     if (url.pathname === "/linear/connect") {
