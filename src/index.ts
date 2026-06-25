@@ -86,6 +86,14 @@ type AgentSessionQueryResult = {
   } | null;
 };
 
+type ActiveAgentSession = {
+  agentId: string;
+  agentSessionId: string;
+  sessionKey: string;
+  cancelled: boolean;
+  abortController: AbortController;
+};
+
 interface CredentialData {
   accessToken: string;
   refreshToken: string;
@@ -93,6 +101,56 @@ interface CredentialData {
   clientId: string;
   clientSecret: string;
   scope: string;
+}
+
+const activeAgentSessions = new Map<string, ActiveAgentSession>();
+
+function buildAgentSessionKey(action: RouterAction): string {
+  return `agent:${action.agentId}:linear-agent-session:${action.agentSessionId}`;
+}
+
+function getOrCreateActiveAgentSession(action: RouterAction): ActiveAgentSession {
+  const agentSessionId = action.agentSessionId!;
+  const existing = activeAgentSessions.get(agentSessionId);
+  if (existing) {
+    existing.agentId = action.agentId;
+    existing.sessionKey = buildAgentSessionKey(action);
+    return existing;
+  }
+
+  const active: ActiveAgentSession = {
+    agentId: action.agentId,
+    agentSessionId,
+    sessionKey: buildAgentSessionKey(action),
+    cancelled: false,
+    abortController: new AbortController(),
+  };
+  activeAgentSessions.set(agentSessionId, active);
+  return active;
+}
+
+function markAgentSessionCancelled(action: RouterAction): ActiveAgentSession | undefined {
+  if (!action.agentSessionId) return undefined;
+  const active = getOrCreateActiveAgentSession(action);
+  active.cancelled = true;
+  active.abortController.abort();
+  return active;
+}
+
+function isAgentSessionCancelled(action: RouterAction): boolean {
+  return action.agentSessionId
+    ? activeAgentSessions.get(action.agentSessionId)?.cancelled === true
+    : false;
+}
+
+function clearActiveAgentSession(action: RouterAction, active: ActiveAgentSession): void {
+  if (
+    action.agentSessionId
+    && activeAgentSessions.get(action.agentSessionId) === active
+    && !active.cancelled
+  ) {
+    activeAgentSessions.delete(action.agentSessionId);
+  }
 }
 
 /**
@@ -795,115 +853,128 @@ async function dispatchAgentSessionAction(
   api: OpenClawPluginApi,
 ): Promise<void> {
   if (!action.agentSessionId) return;
-
-  const core = api.runtime;
-  const cfg = api.config;
-  const accessToken = await getValidAccessToken(api.logger);
-  if (!accessToken) {
-    api.logger.info("[linear] Agent Session skipped: jojo Linear credentials not found");
+  const active = getOrCreateActiveAgentSession(action);
+  if (active.cancelled) {
+    api.logger.info(`[linear] Agent Session ${action.agentSessionId} skipped: stop already requested`);
     return;
   }
-  const startedBody = action.event === "agent_session.prompted"
-    ? "收到你的补充信息了，我继续处理。"
-    : "收到，我开始处理。";
 
-  await createAgentActivity(
-    action.agentSessionId,
-    { type: "thought", body: startedBody },
-    api,
-  );
+  try {
+    const core = api.runtime;
+    const cfg = api.config;
+    const accessToken = await getValidAccessToken(api.logger);
+    if (!accessToken) {
+      api.logger.info("[linear] Agent Session skipped: jojo Linear credentials not found");
+      return;
+    }
+    if (active.cancelled) return;
 
-  alignIssueWithAgentBestPractices(action, accessToken, api).catch((err) => {
-    api.logger.error(`[linear] Best-practice alignment failed: ${formatErrorMessage(err)}`);
-  });
+    const startedBody = action.event === "agent_session.prompted"
+      ? "收到你的补充信息了，我继续处理。"
+      : "收到，我开始处理。";
 
-  const sessionContext = await fetchAgentSessionContext(action, accessToken, api).catch((err) => {
-    api.logger.error(`[linear] Agent Session context fetch failed: ${formatErrorMessage(err)}`);
-    return {
-      conversationText: action.promptContext || action.detail,
-      mediaPaths: [],
-      mediaTypes: [],
-    } satisfies AgentSessionContext;
-  });
+    await createAgentActivity(
+      action.agentSessionId,
+      { type: "thought", body: startedBody },
+      api,
+    );
+    if (active.cancelled) return;
 
-  const body = [
-    "You are responding to a Linear Agent Session.",
-    "",
-    `Issue: ${action.issueLabel}`,
-    `Agent session ID: ${action.agentSessionId}`,
-    "",
-    sessionContext.conversationText,
-    sessionContext.mediaPaths.length > 0
-      ? `Attached Linear file(s) have been downloaded and provided as media inputs: ${sessionContext.mediaPaths.map((p) => p.split("/").pop()).join(", ")}`
-      : "",
-    "",
-    "Reply with the final answer for the Linear user. Do not use the linear_comment tool for this session; your final reply will be sent back as a Linear Agent Activity response.",
-  ].join("\n");
+    alignIssueWithAgentBestPractices(action, accessToken, api).catch((err) => {
+      api.logger.error(`[linear] Best-practice alignment failed: ${formatErrorMessage(err)}`);
+    });
 
-  const ctx = core.channel.reply.finalizeInboundContext({
-    Body: body,
-    BodyForAgent: body,
-    RawBody: body,
-    CommandBody: body,
-    ...(sessionContext.mediaPaths.length > 0
-      ? {
-          MediaPaths: sessionContext.mediaPaths,
-          MediaPath: sessionContext.mediaPaths[0],
-          MediaTypes: sessionContext.mediaTypes,
-          MediaType: sessionContext.mediaTypes[0],
-        }
-      : {}),
-    From: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
-    To: `${CHANNEL_ID}:${action.agentId}`,
-    SessionKey: `agent:${action.agentId}:linear-agent-session:${action.agentSessionId}`,
-    AccountId: "default",
-    ChatType: "direct",
-    ConversationLabel: `Linear Agent Session: ${action.issueLabel}`,
-    SenderId: action.linearUserId,
-    Provider: CHANNEL_ID,
-    Surface: CHANNEL_ID,
-    OriginatingChannel: CHANNEL_ID,
-    OriginatingTo: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
-  });
+    const sessionContext = await fetchAgentSessionContext(action, accessToken, api).catch((err) => {
+      api.logger.error(`[linear] Agent Session context fetch failed: ${formatErrorMessage(err)}`);
+      return {
+        conversationText: action.promptContext || action.detail,
+        mediaPaths: [],
+        mediaTypes: [],
+      } satisfies AgentSessionContext;
+    });
+    if (active.cancelled) return;
 
-  let deliveredFinal = false;
-  const dispatchStartedAtMs = Date.now();
-  const agentSessionReplyOptions = {
-    sourceReplyDeliveryMode: "automatic",
-  } as unknown as NonNullable<
-    Parameters<typeof core.channel.reply.dispatchReplyWithBufferedBlockDispatcher>[0]["replyOptions"]
-  >;
+    const body = [
+      "You are responding to a Linear Agent Session.",
+      "",
+      `Issue: ${action.issueLabel}`,
+      `Agent session ID: ${action.agentSessionId}`,
+      "",
+      sessionContext.conversationText,
+      sessionContext.mediaPaths.length > 0
+        ? `Attached Linear file(s) have been downloaded and provided as media inputs: ${sessionContext.mediaPaths.map((p) => p.split("/").pop()).join(", ")}`
+        : "",
+      "",
+      "Reply with the final answer for the Linear user. Do not use the linear_comment tool for this session; your final reply will be sent back as a Linear Agent Activity response.",
+    ].join("\n");
 
-  await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx,
-    cfg,
-    replyOptions: agentSessionReplyOptions,
-    dispatcherOptions: {
-      deliver: async (payload, info) => {
-        if (info.kind !== "final") return;
-        const text = payload.text?.trim();
-        if (!text || text === "NO_REPLY") return;
-        deliveredFinal = true;
-        await createAgentActivity(
-          action.agentSessionId!,
-          { type: payload.isError ? "error" : "response", body: text },
-          api,
-        );
+    const ctx = core.channel.reply.finalizeInboundContext({
+      Body: body,
+      BodyForAgent: body,
+      RawBody: body,
+      CommandBody: body,
+      ...(sessionContext.mediaPaths.length > 0
+        ? {
+            MediaPaths: sessionContext.mediaPaths,
+            MediaPath: sessionContext.mediaPaths[0],
+            MediaTypes: sessionContext.mediaTypes,
+            MediaType: sessionContext.mediaTypes[0],
+          }
+        : {}),
+      From: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
+      To: `${CHANNEL_ID}:${action.agentId}`,
+      SessionKey: active.sessionKey,
+      AccountId: "default",
+      ChatType: "direct",
+      ConversationLabel: `Linear Agent Session: ${action.issueLabel}`,
+      SenderId: action.linearUserId,
+      Provider: CHANNEL_ID,
+      Surface: CHANNEL_ID,
+      OriginatingChannel: CHANNEL_ID,
+      OriginatingTo: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
+    });
+
+    let deliveredFinal = false;
+    const dispatchStartedAtMs = Date.now();
+    const agentSessionReplyOptions = {
+      sourceReplyDeliveryMode: "automatic",
+      abortSignal: active.abortController.signal,
+    } as unknown as NonNullable<
+      Parameters<typeof core.channel.reply.dispatchReplyWithBufferedBlockDispatcher>[0]["replyOptions"]
+    >;
+
+    await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx,
+      cfg,
+      replyOptions: agentSessionReplyOptions,
+      dispatcherOptions: {
+        deliver: async (payload, info) => {
+          if (active.cancelled || info.kind !== "final") return;
+          const text = payload.text?.trim();
+          if (!text || text === "NO_REPLY") return;
+          deliveredFinal = true;
+          await createAgentActivity(
+            action.agentSessionId!,
+            { type: payload.isError ? "error" : "response", body: text },
+            api,
+          );
+        },
+        onError: (err: unknown) => {
+          if (active.cancelled) return;
+          api.logger.error(
+            `[linear] Agent Session reply error: ${formatErrorMessage(err)}`,
+          );
+        },
       },
-      onError: (err: unknown) => {
-        api.logger.error(
-          `[linear] Agent Session reply error: ${formatErrorMessage(err)}`,
-        );
-      },
-    },
-  });
+    });
 
-  if (!deliveredFinal) {
+    if (active.cancelled || deliveredFinal) return;
     const recoveredFinal = await recoverAgentSessionFinalFromLogs(
       action,
       dispatchStartedAtMs,
       api,
     );
+    if (active.cancelled) return;
     if (recoveredFinal) {
       await createAgentActivity(
         action.agentSessionId,
@@ -918,7 +989,66 @@ async function dispatchAgentSessionAction(
       { type: "error", body: "我这边没有生成可发送的最终回复，请再试一次或直接在评论里补充信息。" },
       api,
     );
+  } catch (err) {
+    if (active.cancelled) {
+      api.logger.info(`[linear] Agent Session ${action.agentSessionId} stopped before completion`);
+      return;
+    }
+    throw err;
+  } finally {
+    clearActiveAgentSession(action, active);
   }
+}
+
+async function dispatchAgentSessionCancel(
+  action: RouterAction,
+  api: OpenClawPluginApi,
+): Promise<void> {
+  if (!action.agentSessionId) return;
+  const active = markAgentSessionCancelled(action);
+  if (!active) return;
+
+  api.logger.info(
+    `[linear] Agent Session ${action.agentSessionId} stop requested; cancelling ${active.sessionKey}`,
+  );
+
+  const core = api.runtime;
+  const cfg = api.config;
+  const body = "/stop";
+  const ctx = core.channel.reply.finalizeInboundContext({
+    Body: body,
+    BodyForAgent: body,
+    RawBody: body,
+    CommandBody: body,
+    BodyForCommands: body,
+    CommandAuthorized: true,
+    CommandTargetSessionKey: active.sessionKey,
+    From: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
+    To: `${CHANNEL_ID}:${action.agentId}`,
+    SessionKey: active.sessionKey,
+    AccountId: "default",
+    ChatType: "direct",
+    ConversationLabel: `Linear Agent Session: ${action.issueLabel}`,
+    SenderId: action.linearUserId,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: `${CHANNEL_ID}:agent-session:${action.agentSessionId}`,
+    MessageSid: `agent-session-stop:${action.agentSessionId}:${Date.now()}`,
+  });
+
+  await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx,
+    cfg,
+    dispatcherOptions: {
+      deliver: async () => {},
+      onError: (err: unknown) => {
+        api.logger.error(
+          `[linear] Agent Session cancel dispatch error: ${formatErrorMessage(err)}`,
+        );
+      },
+    },
+  });
 }
 
 let activeDebouncer: { flushKey: (key: string) => Promise<void> } | undefined;
@@ -1095,6 +1225,15 @@ export function activate(api: OpenClawPluginApi): void {
           `[event-router] ${action.type} agent=${action.agentId} event=${action.event}: ${action.detail}`,
         );
 
+        if (action.type === "cancel") {
+          dispatchAgentSessionCancel(action, api).catch((err) => {
+            api.logger.error(
+              `[linear] Agent Session cancel failed: ${formatErrorMessage(err)}`,
+            );
+          });
+          continue;
+        }
+
         if (action.type === "wake") {
           if (action.agentSessionId) {
             // For agent sessions, ensure token is valid first (async lazy init)
@@ -1103,15 +1242,17 @@ export function activate(api: OpenClawPluginApi): void {
                 api.logger.error(
                   `[linear] Agent Session dispatch failed: ${formatErrorMessage(err)}`,
                 );
-                createAgentActivity(
-                  action.agentSessionId!,
-                  { type: "error", body: `处理失败：${formatErrorMessage(err)}` },
-                  api,
-                ).catch((activityErr) => {
-                  api.logger.error(
-                    `[linear] Agent Session error activity failed: ${formatErrorMessage(activityErr)}`,
-                  );
-                });
+                if (!isAgentSessionCancelled(action)) {
+                  createAgentActivity(
+                    action.agentSessionId!,
+                    { type: "error", body: `处理失败：${formatErrorMessage(err)}` },
+                    api,
+                  ).catch((activityErr) => {
+                    api.logger.error(
+                      `[linear] Agent Session error activity failed: ${formatErrorMessage(activityErr)}`,
+                    );
+                  });
+                }
               })
             );
             continue;

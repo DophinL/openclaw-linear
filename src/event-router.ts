@@ -1,7 +1,7 @@
 import type { LinearWebhookPayload } from "./webhook-handler.js";
 
 export type RouterAction = {
-  type: "wake" | "notify";
+  type: "wake" | "notify" | "cancel";
   agentId: string;
   event: string;
   detail: string;
@@ -17,6 +17,14 @@ export type RouterAction = {
   /** Frozen-in-time prompt context supplied by Linear for Agent Session runs. */
   promptContext?: string;
 };
+
+const AGENT_SESSION_CANCEL_ACTIONS = new Set([
+  "cancel",
+  "canceled",
+  "cancelled",
+  "stop",
+  "stopped",
+]);
 
 export type StateAction = "add" | "remove" | "ignore";
 
@@ -486,7 +494,8 @@ function handleAgentSessionEvent(
   config: EventRouterConfig,
 ): RouterAction[] {
   const normalizedAction = event.action === "create" ? "created" : event.action;
-  if (normalizedAction !== "created" && normalizedAction !== "prompted") {
+  const isCancelAction = AGENT_SESSION_CANCEL_ACTIONS.has(normalizedAction);
+  if (normalizedAction !== "created" && normalizedAction !== "prompted" && !isCancelAction) {
     return [];
   }
 
@@ -510,13 +519,15 @@ function handleAgentSessionEvent(
 
   const detail = normalizedAction === "prompted"
     ? `Linear Agent Session prompted on ${issueLabel}\n\n${promptedBody ?? promptContext}`.trim()
+    : isCancelAction
+      ? `Linear Agent Session stop requested on ${issueLabel}`.trim()
     : `Linear Agent Session created on ${issueLabel}\n\n${promptContext}`.trim();
 
   return [
     {
-      type: "wake",
+      type: isCancelAction ? "cancel" : "wake",
       agentId,
-      event: `agent_session.${normalizedAction}`,
+      event: isCancelAction ? "agent_session.cancelled" : `agent_session.${normalizedAction}`,
       detail,
       issueId,
       issueLabel,

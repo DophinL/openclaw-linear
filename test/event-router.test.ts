@@ -1146,6 +1146,44 @@ describe("event-router", () => {
       ]);
     });
 
+    it.each(["cancelled", "canceled", "cancel", "stop", "stopped"])(
+      "routes %s AgentSessionEvent to cancel the active OpenClaw session",
+      (action) => {
+        const config = makeConfig({}, { agentSessionAgentId: "linear_jojo_agent" });
+        const route = createEventRouter(config);
+
+        const event: LinearWebhookPayload = {
+          type: "AgentSessionEvent",
+          action,
+          data: {
+            appUserId: "app-user-1",
+            agentSession: {
+              id: "session-stop",
+              issue: {
+                id: "issue-stop",
+                identifier: "YOU-STOP",
+                title: "Stop test",
+              },
+            },
+          },
+          createdAt: new Date().toISOString(),
+        };
+
+        expect(route(event)).toEqual([
+          expect.objectContaining({
+            type: "cancel",
+            agentId: "linear_jojo_agent",
+            event: "agent_session.cancelled",
+            detail: "Linear Agent Session stop requested on YOU-STOP: Stop test",
+            issueId: "issue-stop",
+            issueLabel: "YOU-STOP: Stop test",
+            identifier: "YOU-STOP",
+            agentSessionId: "session-stop",
+          }),
+        ]);
+      },
+    );
+
     it("can disable legacy comment mention routing when AgentSession events are preferred", () => {
       const config = makeConfig({ "user-1": "agent-1" }, { routeCommentMentions: false });
       const route = createEventRouter(config);
